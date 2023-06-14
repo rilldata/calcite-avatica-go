@@ -148,24 +148,38 @@ func (c *conn) exec(ctx context.Context, query string, args []namedValue) (drive
 	statementID := st.(*message.CreateStatementResponse).StatementId
 	defer c.closeStatement(context.Background(), statementID)
 
-	res, err := c.httpClient.post(ctx, &message.PrepareAndExecuteRequest{
-		ConnectionId:      c.connectionId,
-		StatementId:       statementID,
-		Sql:               query,
-		MaxRowsTotal:      c.config.maxRowsTotal,
-		FirstFrameMaxSize: c.config.frameMaxSize,
-	})
+	// Create channels to receive the result or cancellation signal
+	resultCh := make(chan interface{}, 1)
+	errCh := make(chan error, 1)
 
-	if err != nil {
+	go func() {
+		res, err := c.httpClient.post(ctx, &message.PrepareAndExecuteRequest{
+			ConnectionId:      c.connectionId,
+			StatementId:       statementID,
+			Sql:               query,
+			MaxRowsTotal:      c.config.maxRowsTotal,
+			FirstFrameMaxSize: c.config.frameMaxSize,
+		})
+
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		resultCh <- res
+	}()
+
+	select {
+	case res := <-resultCh:
+		// Currently there is only 1 ResultSet per response for exec
+		changed := int64(res.(*message.ExecuteResponse).Results[0].UpdateCount)
+		return &result{affectedRows: changed}, nil
+	case err := <-errCh:
 		return nil, c.avaticaErrorToResponseErrorOrError(err)
+	case <-ctx.Done():
+		// close statement is already deferred above, so we don't need to call again
+		return nil, c.avaticaErrorToResponseErrorOrError(ctx.Err())
 	}
-
-	// Currently there is only 1 ResultSet per response for exec
-	changed := int64(res.(*message.ExecuteResponse).Results[0].UpdateCount)
-
-	return &result{
-		affectedRows: changed,
-	}, nil
 }
 
 // Query prepares and executes a query and returns the result directly.
@@ -193,22 +207,40 @@ func (c *conn) query(ctx context.Context, query string, args []namedValue) (driv
 
 	statementID := st.(*message.CreateStatementResponse).StatementId
 
-	res, err := c.httpClient.post(ctx, &message.PrepareAndExecuteRequest{
-		ConnectionId:      c.connectionId,
-		StatementId:       statementID,
-		Sql:               query,
-		MaxRowsTotal:      c.config.maxRowsTotal,
-		FirstFrameMaxSize: c.config.frameMaxSize,
-	})
+	// Create channels to receive the result or cancellation signal
+	resultCh := make(chan interface{}, 1)
+	errCh := make(chan error, 1)
 
-	if err != nil {
+	// Execute the request in a separate goroutine
+	go func() {
+		res, err := c.httpClient.post(ctx, &message.PrepareAndExecuteRequest{
+			ConnectionId:      c.connectionId,
+			StatementId:       statementID,
+			Sql:               query,
+			MaxRowsTotal:      c.config.maxRowsTotal,
+			FirstFrameMaxSize: c.config.frameMaxSize,
+		})
+
+		if err != nil {
+			errCh <- err
+			return
+		}
+
+		resultCh <- res
+	}()
+
+	// Wait for the request completion or context cancellation
+	select {
+	case res := <-resultCh:
+		resultSets := res.(*message.ExecuteResponse).Results
+		return newRows(c, statementID, true, resultSets), nil
+	case err := <-errCh:
 		_ = c.closeStatement(context.Background(), statementID)
 		return nil, c.avaticaErrorToResponseErrorOrError(err)
+	case <-ctx.Done():
+		_ = c.closeStatement(context.Background(), statementID)
+		return nil, c.avaticaErrorToResponseErrorOrError(ctx.Err())
 	}
-
-	resultSets := res.(*message.ExecuteResponse).Results
-
-	return newRows(c, statementID, true, resultSets), nil
 }
 
 func (c *conn) avaticaErrorToResponseErrorOrError(err error) error {
